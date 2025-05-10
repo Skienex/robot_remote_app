@@ -202,7 +202,10 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
     try {
       final response = await http.post(
         Uri.parse('$serverAddress/command'),
-        headers: {'Content-Type': 'application/json'},
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'Roboter App/1.0 (Von Jonte Puschmann)'
+        },
         body: jsonEncode({
           'command': command,
           'value': value,
@@ -1135,6 +1138,16 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
                         ),
                       ),
                     ],
+                  ),
+                  const SizedBox(height: 16), // Etwas Abstand
+                  const Center(
+                    child: Text(
+                      'E-Mail bei Problemen: jonte.puschmann01@gmail.com',
+                      style: TextStyle(
+                        color: Colors.white54,
+                        fontSize: 10,
+                      ),
+                    ),
                   ),
                   const SizedBox(height: 24),
                   Row(
