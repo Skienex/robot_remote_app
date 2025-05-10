@@ -1142,7 +1142,7 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
                   const SizedBox(height: 16), // Etwas Abstand
                   const Center(
                     child: Text(
-                      'E-Mail bei Problemen: jonte.puschmann01@gmail.com',
+                      'E-Mail bei Problemen: jontepuschmann01@gmail.com',
                       style: TextStyle(
                         color: Colors.white54,
                         fontSize: 10,
