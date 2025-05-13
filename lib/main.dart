@@ -57,12 +57,12 @@ class ControllerScreen extends StatefulWidget {
 }
 
 class _ControllerScreenState extends State<ControllerScreen> with SingleTickerProviderStateMixin {
-  String serverAddress = 'http://192.168.1.100:8080'; // <-- Standard-IP, ggf. anpassen
-  String connectionStatus = 'Nicht verbunden';
+  String serverAddress = 'http://10.40.0.1:8080'; // Standard-IP
+  String connectionStatus = 'Initialisierung...'; // Angepasster Startwert
   bool isConnected = false;
 
   // Control parameters
-  int speed = 0; // Speed wird NICHT mehr durch Kippen beeinflusst
+  int speed = 0;
   int direction = 0;
   bool headlightsOn = false;
   bool hornOn = false;
@@ -70,19 +70,24 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
   bool calibrationMode = false;
 
   // Tilt Control parameters
-  bool _useTiltControl = false; // Switch for tilt control
+  bool _useTiltControl = false;
   StreamSubscription? _accelerometerSubscription;
   Timer? _tiltUpdateTimer;
-  final Duration _tiltUpdateInterval = const Duration(milliseconds: 100); // Send updates every 100ms
+  final Duration _tiltUpdateInterval = const Duration(milliseconds: 100);
 
-  // --- Sensitivity and Deadzone for Tilt ---
-  // NEUER WERT: Niedriger = weniger empfindlich (mehr kippen nötig)
-  final double _tiltSensitivitySteering = 8.0; // Vorher 15.0, jetzt WENIGER empfindlich
-  // final double _tiltSensitivitySpeed = 18.0; // WIRD NICHT MEHR BENÖTIGT
-  final double _tiltDeadzone = 0.5; // Ignoriert kleine Bewegungen um die Mitte
+  final double _tiltSensitivitySteering = 8.0;
+  final double _tiltDeadzone = 0.5;
 
-  // Animation controller for effects
   late AnimationController _animationController;
+
+  // --- Automatic Reconnection Parameters ---
+  bool _isManuallyDisconnected = false;
+  Timer? _reconnectTimer;
+  int _reconnectAttempts = 0;
+  static const int _maxReconnectAttempts = 5;
+  static const Duration _initialReconnectDelay = Duration(seconds: 3);
+  static const Duration _maxReconnectDelay = Duration(seconds: 60);
+  // --- End Automatic Reconnection Parameters ---
 
   @override
   void initState() {
@@ -91,24 +96,87 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
       vsync: this,
       duration: const Duration(milliseconds: 800),
     );
-    // Startet nicht sofort, wartet auf Aktivierung
+    // Versuche, sofort eine Verbindung herzustellen nach dem ersten Frame
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        _attemptInitialConnection();
+      }
+    });
+  }
+
+  void _attemptInitialConnection() {
+    // Wird beim Start aufgerufen
+    _testConnection(isManualAttempt: true);
   }
 
   @override
   void dispose() {
     _animationController.dispose();
-    _stopTiltControl(); // Stellt sicher, dass Sensoren und Timer gestoppt sind
+    _stopTiltControl();
+    _reconnectTimer?.cancel(); // Wichtig!
     super.dispose();
   }
 
-  // --- Tilt Control Logic ---
+  // --- Automatic Reconnection Logic ---
+  void _stopAnyReconnectTimersAndResetAttempts() {
+    _reconnectTimer?.cancel();
+    _reconnectTimer = null;
+    _reconnectAttempts = 0;
+  }
 
+  void _handleConnectionLoss() {
+    if (_isManuallyDisconnected || !mounted) {
+      return; // Nicht wiederverbinden, wenn manuell getrennt oder Widget nicht mehr da
+    }
+    // Wenn schon ein Timer läuft, wird er durch den nächsten _scheduleNextReconnectAttempt abgebrochen und neu gestartet.
+    // Starte eine neue Sequenz von Versuchen, wenn kein aktiver Timer läuft.
+    if (_reconnectTimer == null || !_reconnectTimer!.isActive) {
+      _reconnectAttempts = 0;
+    }
+    _scheduleNextReconnectAttempt();
+  }
+
+  void _scheduleNextReconnectAttempt() {
+    _reconnectTimer?.cancel(); // Bestehenden Timer abbrechen
+
+    if (isConnected || _isManuallyDisconnected || !mounted) {
+      _stopAnyReconnectTimersAndResetAttempts(); // Aufräumen
+      return;
+    }
+
+    _reconnectAttempts++;
+
+    if (_reconnectAttempts > _maxReconnectAttempts) {
+      if (mounted) {
+        setState(() {
+          connectionStatus = 'Autom. Wiederverbindung fehlgeschlagen.';
+        });
+      }
+      _stopAnyReconnectTimersAndResetAttempts(); // Versuche beenden
+      return;
+    }
+
+    int delaySeconds = (_initialReconnectDelay.inSeconds * math.pow(2, _reconnectAttempts - 1)).toInt();
+    delaySeconds = math.min(delaySeconds, _maxReconnectDelay.inSeconds);
+
+    if (mounted) {
+      setState(() {
+        connectionStatus = 'Verbindung verloren. Nächster Versuch (${_reconnectAttempts}/${_maxReconnectAttempts}) in ${delaySeconds}s...';
+      });
+    }
+
+    _reconnectTimer = Timer(Duration(seconds: delaySeconds), () {
+      if (!isConnected && !_isManuallyDisconnected && mounted) {
+        _testConnection(); // Nächster Versuch, NICHT als manuell markieren
+      }
+    });
+  }
+  // --- End Automatic Reconnection Logic ---
+
+  // --- Tilt Control Logic (unverändert) ---
   void _startTiltControl() {
-    if (_accelerometerSubscription != null) return; // Läuft bereits
-
+    if (_accelerometerSubscription != null) return;
     _accelerometerSubscription = accelerometerEvents.listen(_handleAccelerometerEvent);
-
-    // Startet den Timer nur, wenn verbunden, sonst beim Verbindungsaufbau
     if (isConnected) {
       _startTiltUpdateTimer();
     }
@@ -118,55 +186,24 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
     _accelerometerSubscription?.cancel();
     _accelerometerSubscription = null;
     _stopTiltUpdateTimer();
-    // Optional: Richtung beim Stoppen der Kippsteuerung zurücksetzen
-    // if (direction != 0) {
-    //   setState(() { direction = 0; });
-    //   _sendCommand('direction', 0);
-    // }
-    // Speed wird NICHT zurückgesetzt, da sie vom Slider kommt
   }
 
   void _handleAccelerometerEvent(AccelerometerEvent event) {
     if (!_useTiltControl || !mounted) return;
-
-    // Orientierung für korrekte Achsenzuordnung bestimmen
-    // final orientation = MediaQuery.of(context).orientation; // Wird nicht unbedingt benötigt
-    double pitch = 0; // Vorwärts/Rückwärts-Neigung (nicht mehr für Speed verwendet)
-    double roll = 0;  // Seitwärts-Neigung für Lenkung
-
-    // Grundlegende Achsenzuordnung für Querformat
-    // Annahme: Y ist Roll (Kippen über kurze Kante), X ist Pitch (Kippen über lange Kante)
-    // Kann zwischen landscapeLeft und landscapeRight wechseln.
-    // Bei Problemen evtl. gyroscope nutzen oder Orientierung prüfen.
-    pitch = -event.x; // Wird aktuell nicht verwendet
-    roll = event.y;   // Y-Achse für die Lenkung (Seitwärtskippen)
-
-    // Deadzone anwenden
-    // if (pitch.abs() < _tiltDeadzone) pitch = 0; // Nicht mehr nötig für Speed
+    double roll = event.y;
     if (roll.abs() < _tiltDeadzone) roll = 0;
-
-    // --- ÄNDERUNG: Speed wird NICHT mehr durch Pitch gesteuert ---
-    // int newSpeed = (pitch * _tiltSensitivitySpeed).clamp(-100, 100).toInt();
-
-    // Roll auf Richtung mappen (-100 bis 100) mit angepasster Sensitivität
     int newDirection = (roll * _tiltSensitivitySteering).clamp(-100, 100).toInt();
-
-    // Zustand nur aktualisieren, wenn sich die Richtung geändert hat
-    // --- ÄNDERUNG: Nur noch 'direction' prüfen ---
     if (newDirection != direction) {
-      if (mounted) { // Prüfen, ob das Widget noch im Baum ist
+      if (mounted) {
         setState(() {
-          // --- ÄNDERUNG: Nur 'direction' setzen ---
           direction = newDirection;
-          // speed wird NICHT geändert
         });
       }
     }
   }
 
-
   void _startTiltUpdateTimer() {
-    _tiltUpdateTimer?.cancel(); // Bestehenden Timer abbrechen
+    _tiltUpdateTimer?.cancel();
     if (_useTiltControl && isConnected) {
       _tiltUpdateTimer = Timer.periodic(_tiltUpdateInterval, (_) {
         _sendTiltCommands();
@@ -180,24 +217,16 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
   }
 
   void _sendTiltCommands() {
-    // Diese Funktion wird periodisch vom Timer aufgerufen
     if (_useTiltControl && isConnected) {
-      // --- ÄNDERUNG: Nur noch den 'direction'-Befehl senden ---
-      // _sendCommand('speed', speed); // Speed wird nicht mehr vom Timer gesendet
-      _sendCommand('direction', direction); // Nur die aktuelle Richtung senden
+      _sendCommand('direction', direction);
     } else {
-      _stopTiltUpdateTimer(); // Stoppen, wenn Bedingungen nicht mehr erfüllt
+      _stopTiltUpdateTimer();
     }
   }
-
   // --- End Tilt Control Logic ---
-
 
   Future<void> _sendCommand(String command, dynamic value) async {
     if (!isConnected) return;
-
-    // Nur zum Debuggen, in Produktion entfernen
-    // print('Sending: $command = $value');
 
     try {
       final response = await http.post(
@@ -206,40 +235,55 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
           'Content-Type': 'application/json',
           'User-Agent': 'Roboter App/1.0 (Von Jonte Puschmann)'
         },
-        body: jsonEncode({
-          'command': command,
-          'value': value,
-        }),
-      ).timeout(const Duration(milliseconds: 500)); // Kürzerer Timeout für häufige Befehle
+        body: jsonEncode({'command': command, 'value': value}),
+      ).timeout(const Duration(milliseconds: 800)); // Leicht erhöhter Timeout
 
       if (response.statusCode == 200) {
-        // Nicht für häufige Kippbefehle animieren, evtl. nur für Tastendrücke?
-        // _animationController.forward(from: 0.0);
+        // Erfolg
       } else {
-        if (mounted){
+        if (mounted) {
+          bool wasConnected = isConnected; // Zustand vor dem Fehler merken
           setState(() {
-            connectionStatus = 'Fehler: ${response.statusCode}';
-            // Verbindung trennen, wenn Befehle wiederholt fehlschlagen?
+            connectionStatus = 'Befehl: Fehler ${response.statusCode}';
+            isConnected = false;
+            _stopTiltUpdateTimer();
           });
+          if (wasConnected && !_isManuallyDisconnected) { // Nur wenn vorher verbunden und nicht manuell getrennt
+            _handleConnectionLoss(); // Startet Wiederverbindungslogik
+          }
         }
       }
     } catch (e) {
-      if (mounted){
+      if (mounted) {
+        bool wasConnected = isConnected;
         setState(() {
-          connectionStatus = 'Verbindungsfehler';
+          connectionStatus = 'Befehl: Verbindungsfehler';
           isConnected = false;
-          _stopTiltUpdateTimer(); // Timer bei Verbindungsverlust stoppen
+          _stopTiltUpdateTimer();
         });
+        if (wasConnected && !_isManuallyDisconnected) {
+          _handleConnectionLoss();
+        }
       }
     }
   }
 
-  Future<void> _testConnection() async {
+  Future<void> _testConnection({bool isManualAttempt = false}) async {
+    if (isManualAttempt) {
+      _isManuallyDisconnected = false; // Ein manueller Versuch hebt manuelle Trennung auf
+      _stopAnyReconnectTimersAndResetAttempts(); // Beendet laufende automatische Versuche
+    }
+
     if (mounted) {
       setState(() {
-        connectionStatus = 'Verbindung wird getestet...';
-        isConnected = false; // Annahme: getrennt während des Tests
-        _stopTiltUpdateTimer(); // Timer während des Tests stoppen
+        if (isManualAttempt) {
+          connectionStatus = 'Verbindung wird hergestellt...';
+        } else {
+          // Dies ist ein automatischer Wiederverbindungsversuch
+          connectionStatus = 'Wiederverbindungsversuch ${_reconnectAttempts}/${_maxReconnectAttempts}...';
+        }
+        if (isManualAttempt) isConnected = false; // Bei manuellem Versuch explizit
+        _stopTiltUpdateTimer(); // Sicherstellen, dass Tilt-Updates pausieren
       });
     }
 
@@ -248,36 +292,56 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
         Uri.parse('$serverAddress/status'),
       ).timeout(const Duration(seconds: 3));
 
-      if (mounted) { // Erneut prüfen, ob Widget nach await noch gemountet ist
+      if (mounted) {
         setState(() {
           if (response.statusCode == 200) {
             connectionStatus = 'Verbunden';
             isConnected = true;
+            _isManuallyDisconnected = false; // Wichtig für Reconnect-Logik
+            _stopAnyReconnectTimersAndResetAttempts(); // Erfolgreich, automatische Versuche stoppen
             if (_useTiltControl) {
-              _startTiltUpdateTimer(); // Timer starten, wenn Kippsteuerung aktiv ist
+              _startTiltUpdateTimer();
             }
           } else {
-            connectionStatus = 'Fehler: ${response.statusCode}';
+            connectionStatus = 'Serverfehler: ${response.statusCode}';
             isConnected = false;
+            if (!_isManuallyDisconnected) {
+              _scheduleNextReconnectAttempt(); // Nächsten Versuch planen
+            }
           }
         });
       }
     } catch (e) {
       if (mounted) {
         setState(() {
-          connectionStatus = 'Keine Verbindung möglich';
+          connectionStatus = 'Keine Verbindung (Host nicht erreichbar)';
           isConnected = false;
         });
+        if (!_isManuallyDisconnected) {
+          _scheduleNextReconnectAttempt(); // Nächsten Versuch planen
+        }
       }
     }
   }
 
+  void _disconnectManually() {
+    if (mounted) {
+      setState(() {
+        isConnected = false;
+        _isManuallyDisconnected = true;
+        connectionStatus = 'Manuell getrennt';
+        _stopTiltControl(); // Stoppt Sensoren und Tilt-Timer
+        _stopAnyReconnectTimersAndResetAttempts(); // Stoppt auch alle Wiederverbindungsversuche
+      });
+      print("Manually disconnected by user.");
+    }
+  }
+
+
   @override
   Widget build(BuildContext context) {
-    // Haupt-Build-Methode bleibt weitgehend gleich
     return Scaffold(
       body: Container(
-        // ... Rest der Dekoration ...
         decoration: BoxDecoration(
           gradient: LinearGradient(
             begin: Alignment.topCenter,
@@ -320,12 +384,10 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
   }
 
   Widget _buildHeader() {
-    // Header Build-Methode bleibt gleich
     final primary = Theme.of(context).colorScheme.primary;
 
     return Row(
       children: [
-        // Logo area
         Container(
           width: 60,
           height: 60,
@@ -333,20 +395,10 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
           decoration: BoxDecoration(
             color: Colors.black26,
             borderRadius: BorderRadius.circular(12),
-            border: Border.all(
-              color: primary.withOpacity(0.5),
-              width: 2,
-            ),
+            border: Border.all(color: primary.withOpacity(0.5), width: 2),
           ),
-          child: Center(
-            child: Icon(
-              Icons.directions_car,
-              color: primary,
-              size: 32,
-            ),
-          ),
+          child: Center(child: Icon(Icons.directions_car, color: primary, size: 32)),
         ),
-        // Title and status
         Expanded(
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
@@ -361,73 +413,94 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
             child: Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                Text(
-                  'RC CONTROLLER',
-                  style: TextStyle(
-                    fontSize: 22,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 1.5,
-                    color: primary,
+                Text('RC CONTROLLER', style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, letterSpacing: 1.5, color: primary)),
+                Flexible( // Damit der Status nicht überläuft
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min, // Nimmt nur so viel Platz wie nötig
+                    children: [
+                      Container(
+                        width: 10, height: 10,
+                        decoration: BoxDecoration(
+                          shape: BoxShape.circle,
+                          color: isConnected ? Colors.greenAccent : Colors.redAccent,
+                          boxShadow: [BoxShadow(color: (isConnected ? Colors.greenAccent : Colors.redAccent).withOpacity(0.6), blurRadius: 6, spreadRadius: 1)],
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Flexible( // Für lange Statusnachrichten
+                        child: Text(
+                          connectionStatus,
+                          style: TextStyle(color: isConnected ? Colors.greenAccent : Colors.redAccent, fontWeight: FontWeight.w500),
+                          overflow: TextOverflow.ellipsis, // Bei Überlauf ... anzeigen
+                        ),
+                      ),
+                    ],
                   ),
-                ),
-                Row(
-                  children: [
-                    Container(
-                      width: 10,
-                      height: 10,
-                      decoration: BoxDecoration(
-                        shape: BoxShape.circle,
-                        color: isConnected ? Colors.greenAccent : Colors.redAccent,
-                        boxShadow: [
-                          BoxShadow(
-                            color: isConnected
-                                ? Colors.greenAccent.withOpacity(0.6)
-                                : Colors.redAccent.withOpacity(0.6),
-                            blurRadius: 6,
-                            spreadRadius: 1,
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(width: 8),
-                    Text(
-                      connectionStatus,
-                      style: TextStyle(
-                        color: isConnected ? Colors.greenAccent : Colors.redAccent,
-                        fontWeight: FontWeight.w500,
-                      ),
-                    ),
-                  ],
                 ),
               ],
             ),
           ),
         ),
-        const SizedBox(width: 16),
-        // Settings button
+        const SizedBox(width: 10),
+        // --- NEUER "Verbindung trennen / herstellen"-Knopf ---
+        AnimatedSwitcher(
+          duration: const Duration(milliseconds: 300),
+          transitionBuilder: (Widget child, Animation<double> animation) {
+            return ScaleTransition(scale: animation, child: child);
+          },
+          child: isConnected
+              ? IconButton(
+            key: const ValueKey('disconnect_btn'), // Wichtig für AnimatedSwitcher
+            onPressed: _disconnectManually,
+            icon: const Icon(Icons.link_off),
+            tooltip: 'Verbindung trennen',
+            style: IconButton.styleFrom(
+              backgroundColor: Colors.redAccent.withOpacity(0.15),
+              foregroundColor: Colors.redAccent,
+              padding: const EdgeInsets.all(16),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+                side: BorderSide(color: Colors.redAccent.withOpacity(0.4), width: 1.5),
+              ),
+            ),
+          )
+              : IconButton(
+            key: const ValueKey('connect_btn'),
+            onPressed: () { // Öffnet den Dialog zum Verbinden/Einstellungen
+              showDialog(
+                context: context,
+                builder: (context) => _buildConnectionDialog(),
+              );
+            },
+            icon: const Icon(Icons.wifi_off, color: Colors.orangeAccent),
+            tooltip: 'Verbindung herstellen / Einstellungen',
+            style: IconButton.styleFrom(
+              backgroundColor: Colors.orangeAccent.withOpacity(0.15),
+              foregroundColor: Colors.orangeAccent,
+              padding: const EdgeInsets.all(16),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+                side: BorderSide(color: Colors.orangeAccent.withOpacity(0.4), width: 1.5),
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(width: 8), // Immer Abstand zum Settings-Knopf
+        // Settings button (existierend)
         IconButton(
           onPressed: () {
             showDialog(
               context: context,
               builder: (context) => _buildConnectionDialog(),
-            ).then((_) {
-              // Hier müssen wir nichts extra tun, da der Switch im Dialog
-              // direkt den State (_useTiltControl) und die Listener aktualisiert.
-            });
+            );
           },
-          icon: Icon(
-            Icons.settings,
-            color: primary,
-          ),
+          icon: Icon(Icons.settings, color: primary),
           style: IconButton.styleFrom(
             backgroundColor: Colors.black26,
             padding: const EdgeInsets.all(16),
             shape: RoundedRectangleBorder(
               borderRadius: BorderRadius.circular(12),
-              side: BorderSide(
-                color: primary.withOpacity(0.5),
-                width: 1.5,
-              ),
+              side: BorderSide(color: primary.withOpacity(0.5), width: 1.5),
             ),
           ),
         ),
@@ -437,61 +510,37 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
 
   Widget _buildControlPanel() {
     final primary = Theme.of(context).colorScheme.primary;
-
     return Container(
       decoration: BoxDecoration(
         color: Colors.black12,
         borderRadius: BorderRadius.circular(24),
-        border: Border.all(
-          color: primary.withOpacity(0.3),
-          width: 1.5,
-        ),
+        border: Border.all(color: primary.withOpacity(0.3), width: 1.5),
       ),
       child: Padding(
         padding: const EdgeInsets.all(20.0),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // Control panel header
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 Text(
-                  _useTiltControl ? 'STEUERUNG (KIPPEN/TOUCH)' : 'STEUERUNG (TOUCH)', // Angepasster Text
-                  style: TextStyle(
-                    fontSize: 16,
-                    fontWeight: FontWeight.bold,
-                    letterSpacing: 2,
-                    color: primary,
-                  ),
+                  _useTiltControl ? 'STEUERUNG (KIPPEN/TOUCH)' : 'STEUERUNG (TOUCH)',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, letterSpacing: 2, color: primary),
                 ),
                 Container(
                   padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
                   decoration: BoxDecoration(
                     color: Colors.black26,
                     borderRadius: BorderRadius.circular(30),
-                    border: Border.all(
-                      color: primary.withOpacity(0.3),
-                      width: 1,
-                    ),
+                    border: Border.all(color: primary.withOpacity(0.3), width: 1),
                   ),
                   child: Row(
                     children: [
+                      Text('Status: ', style: TextStyle(fontSize: 12, color: Colors.white.withOpacity(0.7))),
                       Text(
-                        'Status: ',
-                        style: TextStyle(
-                          fontSize: 12,
-                          color: Colors.white.withOpacity(0.7),
-                        ),
-                      ),
-                      Text(
-                        // Status basiert jetzt auf Speed ODER Direction
                         speed != 0 || direction != 0 ? 'AKTIV' : 'BEREIT',
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.bold,
-                          color: speed != 0 || direction != 0 ? Colors.greenAccent : Colors.white,
-                        ),
+                        style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: speed != 0 || direction != 0 ? Colors.greenAccent : Colors.white),
                       ),
                     ],
                   ),
@@ -499,11 +548,9 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
               ],
             ),
             const SizedBox(height: 20),
-            // Control elements
             Expanded(
               child: Row(
                 children: [
-                  // Steering control
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -511,24 +558,16 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
                         Padding(
                           padding: const EdgeInsets.only(left: 12.0),
                           child: Text(
-                            // Info, ob Kippen oder Touch aktiv ist
                             _useTiltControl ? 'LENKUNG (KIPPEN)' : 'LENKUNG (TOUCH)',
-                            style: TextStyle(
-                              fontSize: 14,
-                              fontWeight: FontWeight.w500,
-                              color: Colors.white.withOpacity(0.7),
-                            ),
+                            style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: Colors.white.withOpacity(0.7)),
                           ),
                         ),
                         const SizedBox(height: 12),
-                        Expanded(
-                          child: _buildSteeringWheel(), // Visuell gedimmt, wenn Kippen aktiv
-                        ),
+                        Expanded(child: _buildSteeringWheel()),
                       ],
                     ),
                   ),
                   const SizedBox(width: 24),
-                  // Speed control
                   Expanded(
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
@@ -536,18 +575,12 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
                         Padding(
                           padding: const EdgeInsets.only(left: 12.0),
                           child: Text(
-                            'GESCHWINDIGKEIT (TOUCH)', // Immer Touch
-                            style: TextStyle(
-                              fontSize: 14,
-                              fontWeight: FontWeight.w500,
-                              color: Colors.white.withOpacity(0.7),
-                            ),
+                            'GESCHWINDIGKEIT (TOUCH)',
+                            style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500, color: Colors.white.withOpacity(0.7)),
                           ),
                         ),
                         const SizedBox(height: 12),
-                        Expanded(
-                          child: _buildSpeedControl(), // Immer aktiv
-                        ),
+                        Expanded(child: _buildSpeedControl()),
                       ],
                     ),
                   ),
@@ -562,142 +595,71 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
 
   Widget _buildSteeringWheel() {
     final primary = Theme.of(context).colorScheme.primary;
-    // Visuelle Darstellung bleibt gleich, wird durch 'direction' gesteuert
-    // Interaktion ist deaktiviert, wenn Kippsteuerung aktiv ist
     return GestureDetector(
       onPanUpdate: (details) {
-        // --- ÄNDERUNG: Touch ignorieren, wenn Kippsteuerung aktiv ist ---
-        if (_useTiltControl) return;
+        if (_useTiltControl || !isConnected) return; // Auch bei keiner Verbindung deaktivieren
         double dx = details.delta.dx;
         if (dx != 0) {
           setState(() {
-            direction = (direction + dx.toInt()*2).clamp(-100, 100); // Empfindlichkeit ggf. anpassen
+            direction = (direction + dx.toInt() * 2).clamp(-100, 100);
           });
           _sendCommand('direction', direction);
         }
       },
       onPanEnd: (_) {
-        // --- ÄNDERUNG: Touch ignorieren, wenn Kippsteuerung aktiv ist ---
-        if (_useTiltControl) return;
-        // Nur zur Mitte zurückkehren, wenn Touch losgelassen wird
-        setState(() {
-          direction = 0;
-        });
+        if (_useTiltControl || !isConnected) return;
+        setState(() { direction = 0; });
         _sendCommand('direction', 0);
       },
       onTapDown: (_) {
-        // --- ÄNDERUNG: Touch ignorieren, wenn Kippsteuerung aktiv ist ---
-        if (!_useTiltControl) {
-          setState(() { direction = 0; });
-          _sendCommand('direction', 0);
+        if (!_useTiltControl && isConnected) { // Nur wenn Touch aktiv und verbunden
+          setState(() { direction = 0; }); // Start bei 0
+          // _sendCommand('direction', 0); // Senden erst bei Bewegung
         }
       },
       onTapUp: (_) {
-        // --- ÄNDERUNG: Touch ignorieren, wenn Kippsteuerung aktiv ist ---
-        if (!_useTiltControl) {
+        if (!_useTiltControl && isConnected) { // Nur wenn Touch aktiv und verbunden
           setState(() { direction = 0; });
           _sendCommand('direction', 0);
         }
       },
-      child: Opacity( // Visuell andeuten, dass es inaktiv ist bei Kippsteuerung
-        opacity: _useTiltControl ? 0.5 : 1.0,
+      child: Opacity(
+        opacity: _useTiltControl || !isConnected ? 0.5 : 1.0, // Auch bei keiner Verbindung dimmen
         child: Container(
-          // ... Dekoration bleibt gleich ...
           decoration: BoxDecoration(
-            color: Colors.black26, // Farbe nicht mehr basierend auf _useTiltControl ändern
+            color: Colors.black26,
             shape: BoxShape.circle,
-            border: Border.all(
-              color: primary.withOpacity(0.5),
-              width: 1.5,
-            ),
-            boxShadow: [
-              BoxShadow(
-                color: primary.withOpacity(0.2),
-                blurRadius: 10,
-                spreadRadius: 1,
-              ),
-            ],
+            border: Border.all(color: primary.withOpacity(0.5), width: 1.5),
+            boxShadow: [BoxShadow(color: primary.withOpacity(0.2), blurRadius: 10, spreadRadius: 1)],
           ),
           child: Center(
             child: Stack(
               alignment: Alignment.center,
               children: [
-                // Lenkradbasis
                 Container(
-                  width: 140,
-                  height: 140,
+                  width: 140, height: 140,
                   decoration: BoxDecoration(
                     shape: BoxShape.circle,
-                    gradient: RadialGradient(
-                      colors: [
-                        primary.withOpacity(0.2),
-                        Colors.transparent,
-                      ],
-                      stops: const [0.0, 0.7],
-                    ),
+                    gradient: RadialGradient(colors: [primary.withOpacity(0.2), Colors.transparent], stops: const [0.0, 0.7]),
                   ),
                 ),
-                // Drehender Teil - rotiert basierend auf 'direction'
                 Transform.rotate(
-                  angle: direction * 0.01 * math.pi / 2, // Mappt -100..100 auf -pi/2..pi/2
+                  angle: direction * 0.01 * math.pi / 2,
                   child: Container(
-                    width: 120,
-                    height: 120,
+                    width: 120, height: 120,
                     decoration: BoxDecoration(
                       shape: BoxShape.circle,
-                      border: Border.all(
-                        color: primary.withOpacity(0.5),
-                        width: 2,
-                      ),
+                      border: Border.all(color: primary.withOpacity(0.5), width: 2),
                     ),
                     child: Stack(
                       alignment: Alignment.center,
                       children: [
-                        // Speichen
-                        Transform.rotate(
-                          angle: math.pi / 4,
-                          child: Container(
-                            width: 100,
-                            height: 8,
-                            decoration: BoxDecoration(
-                              color: primary.withOpacity(0.3),
-                              borderRadius: BorderRadius.circular(4),
-                            ),
-                          ),
-                        ),
-                        Transform.rotate(
-                          angle: -math.pi / 4,
-                          child: Container(
-                            width: 100,
-                            height: 8,
-                            decoration: BoxDecoration(
-                              color: primary.withOpacity(0.3),
-                              borderRadius: BorderRadius.circular(4),
-                            ),
-                          ),
-                        ),
-                        // Mitte
+                        Transform.rotate(angle: math.pi / 4, child: Container(width: 100, height: 8, decoration: BoxDecoration(color: primary.withOpacity(0.3), borderRadius: BorderRadius.circular(4)))),
+                        Transform.rotate(angle: -math.pi / 4, child: Container(width: 100, height: 8, decoration: BoxDecoration(color: primary.withOpacity(0.3), borderRadius: BorderRadius.circular(4)))),
                         Container(
-                          width: 30,
-                          height: 30,
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: Colors.black45,
-                            border: Border.all(
-                              color: primary.withOpacity(0.5),
-                              width: 1.5,
-                            ),
-                          ),
-                          child: Center(
-                            child: Text(
-                              '$direction', // Zeigt immer aktuelle Richtung
-                              style: TextStyle(
-                                color: primary,
-                                fontWeight: FontWeight.bold,
-                                fontSize: 14,
-                              ),
-                            ),
-                          ),
+                          width: 30, height: 30,
+                          decoration: BoxDecoration(shape: BoxShape.circle, color: Colors.black45, border: Border.all(color: primary.withOpacity(0.5), width: 1.5)),
+                          child: Center(child: Text('$direction', style: TextStyle(color: primary, fontWeight: FontWeight.bold, fontSize: 14))),
                         ),
                       ],
                     ),
@@ -713,307 +675,216 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
 
   Widget _buildSpeedControl() {
     final theme = Theme.of(context);
-    // Visuelle Darstellung bleibt gleich, wird durch 'speed' gesteuert
-    // --- ÄNDERUNG: Immer aktiv, unabhängig von _useTiltControl ---
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.black26, // Farbe nicht mehr basierend auf _useTiltControl ändern
-        borderRadius: BorderRadius.circular(22),
-        border: Border.all(
-          color: theme.colorScheme.primary.withOpacity(0.5),
-          width: 1.5,
+    return Opacity( // Auch hier Opacity, wenn nicht verbunden
+      opacity: !isConnected ? 0.5 : 1.0,
+      child: Container(
+        decoration: BoxDecoration(
+          color: Colors.black26,
+          borderRadius: BorderRadius.circular(22),
+          border: Border.all(color: theme.colorScheme.primary.withOpacity(0.5), width: 1.5),
         ),
-      ),
-      child: LayoutBuilder(
-        builder: (context, constraints) {
-          return GestureDetector(
-            onVerticalDragUpdate: (details) {
-              // --- KEINE Prüfung mehr auf _useTiltControl ---
-              double dy = details.delta.dy;
-              if (dy != 0) {
-                setState(() {
-                  // Empfindlichkeit ggf. anpassen
-                  speed = (speed - dy.toInt()).clamp(-100, 100);
-                });
-                _sendCommand('speed', speed);
-              }
-            },
-            onVerticalDragEnd: (_) {
-              // --- KEINE Prüfung mehr auf _useTiltControl ---
-              // Zurück auf 0, wenn Touch losgelassen wird
-              setState(() {
-                speed = 0;
-              });
-              _sendCommand('speed', 0);
-            },
-            onTapDown: (_) {
-              // --- KEINE Prüfung mehr auf _useTiltControl ---
-              setState(() { speed = 0; });
-              _sendCommand('speed', 0);
-            },
-            onTapUp: (_) {
-              // --- KEINE Prüfung mehr auf _useTiltControl ---
-              setState(() { speed = 0; });
-              _sendCommand('speed', 0);
-            },
-            child: Stack(
-              children: [
-                // Geschwindigkeitsmesser-Hintergrund
-                Container(
-                  width: double.infinity,
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.circular(20),
-                    gradient: LinearGradient(
-                      begin: Alignment.topCenter,
-                      end: Alignment.bottomCenter,
-                      colors: [
-                        Colors.greenAccent.withOpacity(0.3),
-                        Colors.blueGrey.withOpacity(0.05),
-                        Colors.redAccent.withOpacity(0.3),
-                      ],
-                      stops: const [0.0, 0.5, 1.0],
-                    ),
-                  ),
-                ),
-                // Geschwindigkeitsindikator-Linie - aktualisiert basierend auf 'speed'
-                Positioned(
-                  left: 0,
-                  right: 0,
-                  // Position basierend auf aktuellem Speed berechnen
-                  top: constraints.maxHeight / 2 - (speed / 100 * constraints.maxHeight / 2),
-                  child: Container(
-                    height: 3,
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            return GestureDetector(
+              onVerticalDragUpdate: (details) {
+                if (!isConnected) return; // Deaktivieren, wenn nicht verbunden
+                double dy = details.delta.dy;
+                if (dy != 0) {
+                  setState(() {
+                    speed = (speed - dy.toInt()).clamp(-100, 100);
+                  });
+                  _sendCommand('speed', speed);
+                }
+              },
+              onVerticalDragEnd: (_) {
+                if (!isConnected) return;
+                setState(() { speed = 0; });
+                _sendCommand('speed', 0);
+              },
+              onTapDown: (_) {
+                if (isConnected) { // Nur wenn verbunden
+                  setState(() { speed = 0; });
+                  // _sendCommand('speed', 0); // Senden erst bei Bewegung
+                }
+              },
+              onTapUp: (_) {
+                if (isConnected) { // Nur wenn verbunden
+                  setState(() { speed = 0; });
+                  _sendCommand('speed', 0);
+                }
+              },
+              child: Stack(
+                children: [
+                  Container(
+                    width: double.infinity,
                     decoration: BoxDecoration(
-                      color: speed > 0
-                          ? Colors.greenAccent
-                          : (speed < 0 ? Colors.redAccent : theme.colorScheme.primary),
-                      boxShadow: [
-                        BoxShadow(
-                          color: (speed > 0
-                              ? Colors.greenAccent
-                              : (speed < 0 ? Colors.redAccent : theme.colorScheme.primary)).withOpacity(0.6),
-                          blurRadius: 6,
-                          spreadRadius: 1,
-                        ),
-                      ],
+                      borderRadius: BorderRadius.circular(20),
+                      gradient: LinearGradient(
+                        begin: Alignment.topCenter, end: Alignment.bottomCenter,
+                        colors: [Colors.greenAccent.withOpacity(0.3), Colors.blueGrey.withOpacity(0.05), Colors.redAccent.withOpacity(0.3)],
+                        stops: const [0.0, 0.5, 1.0],
+                      ),
                     ),
                   ),
-                ),
-                // Geschwindigkeitswert und Label - aktualisiert basierend auf 'speed'
-                Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      Text(
-                        speed.abs().toString(), // Zeigt immer den Absolutwert der Geschwindigkeit
-                        style: TextStyle(
-                          fontSize: 32,
-                          fontWeight: FontWeight.bold,
-                          color: speed > 0
-                              ? Colors.greenAccent
-                              : (speed < 0 ? Colors.redAccent : Colors.white),
-                        ),
+                  Positioned(
+                    left: 0, right: 0,
+                    top: constraints.maxHeight / 2 - (speed / 100 * constraints.maxHeight / 2),
+                    child: Container(
+                      height: 3,
+                      decoration: BoxDecoration(
+                        color: speed > 0 ? Colors.greenAccent : (speed < 0 ? Colors.redAccent : theme.colorScheme.primary),
+                        boxShadow: [BoxShadow(color: (speed > 0 ? Colors.greenAccent : (speed < 0 ? Colors.redAccent : theme.colorScheme.primary)).withOpacity(0.6), blurRadius: 6, spreadRadius: 1)],
                       ),
-                      const SizedBox(height: 8),
-                      Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                        decoration: BoxDecoration(
-                          color: speed != 0 ? Colors.black38 : Colors.transparent,
-                          borderRadius: BorderRadius.circular(12),
+                    ),
+                  ),
+                  Center(
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        Text(
+                          speed.abs().toString(),
+                          style: TextStyle(fontSize: 32, fontWeight: FontWeight.bold, color: speed > 0 ? Colors.greenAccent : (speed < 0 ? Colors.redAccent : Colors.white)),
                         ),
-                        child: Text(
-                          speed > 0
-                              ? 'VORWÄRTS'
-                              : (speed < 0 ? 'RÜCKWÄRTS' : 'NEUTRAL'), // Zeigt NEUTRAL bei 0
-                          style: TextStyle(
-                            fontSize: 12,
-                            fontWeight: FontWeight.bold,
-                            color: speed > 0
-                                ? Colors.greenAccent
-                                : (speed < 0 ? Colors.redAccent : Colors.white70),
+                        const SizedBox(height: 8),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                          decoration: BoxDecoration(color: speed != 0 ? Colors.black38 : Colors.transparent, borderRadius: BorderRadius.circular(12)),
+                          child: Text(
+                            speed > 0 ? 'VORWÄRTS' : (speed < 0 ? 'RÜCKWÄRTS' : 'NEUTRAL'),
+                            style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: speed > 0 ? Colors.greenAccent : (speed < 0 ? Colors.redAccent : Colors.white70)),
                           ),
                         ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
-                ),
-              ],
-            ),
-          );
-        },
+                ],
+              ),
+            );
+          },
+        ),
       ),
     );
   }
 
-
   Widget _buildExtraControls() {
-    // Extra-Steuerelemente bleiben unverändert, immer nutzbar
     final primary = Theme.of(context).colorScheme.primary;
     final secondary = Theme.of(context).colorScheme.secondary;
-
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.black12,
-        borderRadius: BorderRadius.circular(24),
-        border: Border.all(
-          color: primary.withOpacity(0.3),
-          width: 1.5,
+    return Opacity( // Auch hier Opacity, wenn nicht verbunden
+      opacity: !isConnected ? 0.5 : 1.0,
+      child: Container(
+        decoration: BoxDecoration(
+          color: Colors.black12,
+          borderRadius: BorderRadius.circular(24),
+          border: Border.all(color: primary.withOpacity(0.3), width: 1.5),
         ),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(20.0),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              'ZUSATZFUNKTIONEN',
-              style: TextStyle(
-                fontSize: 16,
-                fontWeight: FontWeight.bold,
-                letterSpacing: 2,
-                color: primary,
-              ),
-            ),
-            const SizedBox(height: 20),
-            // Features grid
-            Expanded(
-              child: GridView.count(
-                crossAxisCount: 2,
-                mainAxisSpacing: 16,
-                crossAxisSpacing: 16,
-                children: [
-                  _buildFeatureButton(
-                    icon: Icons.lightbulb_outline,
-                    label: 'LICHT',
-                    isActive: headlightsOn,
-                    color: secondary,
-                    onPressed: () {
-                      setState(() {
-                        headlightsOn = !headlightsOn;
-                      });
-                      _sendCommand('headlights', headlightsOn);
-                    },
-                  ),
-                  _buildFeatureButton(
-                    icon: Icons.volume_up,
-                    label: 'HUPE',
-                    isActive: hornOn,
-                    color: secondary,
-                    onPressed: () {
-                      if (hornOn) return; // Verhindert Dauerhupe
-                      setState(() { hornOn = true; });
-                      _sendCommand('horn', true);
-                      Future.delayed(const Duration(milliseconds: 500), () {
-                        if (mounted) {
-                          setState(() { hornOn = false; });
-                          _sendCommand('horn', false);
-                        }
-                      });
-                    },
-                  ),
-                  _buildFeatureButton(
-                    icon: Icons.speed,
-                    label: 'TURBO',
-                    isActive: turboMode,
-                    color: secondary,
-                    onPressed: () {
-                      if (turboMode) return; // Verhindert erneutes Auslösen
-                      setState(() { turboMode = true; });
-                      _sendCommand('turbo', true);
-                      Future.delayed(const Duration(seconds: 2), () {
-                        if (mounted) {
-                          setState(() { turboMode = false; });
-                          _sendCommand('turbo', false);
-                        }
-                      });
-                    },
-                  ),
-                  _buildFeatureButton(
-                    icon: Icons.settings_backup_restore,
-                    label: 'KALIBRIEREN',
-                    isActive: calibrationMode,
-                    color: secondary,
-                    onPressed: () {
-                      if (calibrationMode) return; // Verhindert erneutes Auslösen
-                      setState(() { calibrationMode = true; });
-                      _sendCommand('calibrate', true);
-                      Future.delayed(const Duration(seconds: 1), () { // Kürzere Verzögerung?
-                        if (mounted) {
-                          setState(() { calibrationMode = false; });
-                          // 'calibrate false' muss normalerweise nicht gesendet werden
-                        }
-                      });
-                    },
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 16),
-            // Batteriestatus (Beispiel)
-            Container(
-              // ... Batterie-Status-Dekoration ...
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              decoration: BoxDecoration(
-                color: Colors.black26,
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(
-                  color: primary.withOpacity(0.3),
-                  width: 1,
+        child: Padding(
+          padding: const EdgeInsets.all(20.0),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text('ZUSATZFUNKTIONEN', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold, letterSpacing: 2, color: primary)),
+              const SizedBox(height: 20),
+              Expanded(
+                child: GridView.count(
+                  crossAxisCount: 2, mainAxisSpacing: 16, crossAxisSpacing: 16,
+                  children: [
+                    _buildFeatureButton(
+                      icon: Icons.lightbulb_outline, label: 'LICHT', isActive: headlightsOn, color: secondary,
+                      onPressed: () {
+                        if (!isConnected) return;
+                        setState(() { headlightsOn = !headlightsOn; });
+                        _sendCommand('headlights', headlightsOn);
+                      },
+                    ),
+                    _buildFeatureButton(
+                      icon: Icons.volume_up, label: 'HUPE', isActive: hornOn, color: secondary,
+                      onPressed: () {
+                        if (!isConnected || hornOn) return;
+                        setState(() { hornOn = true; });
+                        _sendCommand('horn', true);
+                        Future.delayed(const Duration(milliseconds: 500), () {
+                          if (mounted && hornOn) { // Nur ausschalten, wenn noch aktiv
+                            setState(() { hornOn = false; });
+                            _sendCommand('horn', false);
+                          }
+                        });
+                      },
+                    ),
+                    _buildFeatureButton(
+                      icon: Icons.speed, label: 'TURBO', isActive: turboMode, color: secondary,
+                      onPressed: () {
+                        if (!isConnected || turboMode) return;
+                        setState(() { turboMode = true; });
+                        _sendCommand('turbo', true);
+                        Future.delayed(const Duration(seconds: 2), () {
+                          if (mounted && turboMode) {
+                            setState(() { turboMode = false; });
+                            _sendCommand('turbo', false);
+                          }
+                        });
+                      },
+                    ),
+                    _buildFeatureButton(
+                      icon: Icons.settings_backup_restore, label: 'KALIBRIEREN', isActive: calibrationMode, color: secondary,
+                      onPressed: () {
+                        if (!isConnected || calibrationMode) return;
+                        setState(() { calibrationMode = true; });
+                        _sendCommand('calibrate', true);
+                        Future.delayed(const Duration(seconds: 1), () {
+                          if (mounted && calibrationMode) {
+                            setState(() { calibrationMode = false; });
+                          }
+                        });
+                      },
+                    ),
+                  ],
                 ),
               ),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Row(
-                    children: [
-                      Icon(
-                        Icons.battery_charging_full,
-                        color: primary,
-                        size: 18,
-                      ),
-                      const SizedBox(width: 8),
-                      Text(
-                        'BATTERIE',
-                        style: TextStyle(
-                          fontSize: 12,
-                          fontWeight: FontWeight.w500,
-                          color: Colors.white.withOpacity(0.7),
+              const SizedBox(height: 16),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                decoration: BoxDecoration(
+                  color: Colors.black26,
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: primary.withOpacity(0.3), width: 1),
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(Icons.battery_charging_full, color: primary, size: 18),
+                        const SizedBox(width: 8),
+                        Text('BATTERIE', style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: Colors.white.withOpacity(0.7))),
+                      ],
+                    ),
+                    Row(
+                      children: [
+                        Container(
+                          width: 100, height: 6,
+                          decoration: BoxDecoration(color: Colors.black45, borderRadius: BorderRadius.circular(3)),
+                          child: Row(children: [
+                            Container(width: 75, decoration: BoxDecoration(color: Colors.greenAccent, borderRadius: BorderRadius.circular(3), boxShadow: [BoxShadow(color: Colors.greenAccent.withOpacity(0.6), blurRadius: 4, spreadRadius: 0)])),
+                          ]),
                         ),
-                      ),
-                    ],
-                  ),
-                  // Beispiel statische Batterieanzeige
-                  Row(
-                    children: [
-                      Container(
-                        width: 100, height: 6,
-                        decoration: BoxDecoration( color: Colors.black45, borderRadius: BorderRadius.circular(3),),
-                        child: Row( children: [
-                          Container( width: 75, decoration: BoxDecoration( color: Colors.greenAccent, borderRadius: BorderRadius.circular(3), boxShadow: [ BoxShadow( color: Colors.greenAccent.withOpacity(0.6), blurRadius: 4, spreadRadius: 0,) ],),),
-                        ],
-                        ),
-                      ),
-                      const SizedBox(width: 8),
-                      const Text('75%', style: TextStyle( fontSize: 12, fontWeight: FontWeight.bold, color: Colors.greenAccent,),),
-                    ],
-                  ),
-                ],
+                        const SizedBox(width: 8),
+                        const Text('75%', style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: Colors.greenAccent)),
+                      ],
+                    ),
+                  ],
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
   }
 
   Widget _buildFeatureButton({
-    required IconData icon,
-    required String label,
-    required bool isActive,
-    required Color color,
-    required VoidCallback onPressed,
+    required IconData icon, required String label, required bool isActive,
+    required Color color, required VoidCallback onPressed,
   }) {
-    // Feature-Button bleibt gleich
     return InkWell(
       onTap: onPressed,
       borderRadius: BorderRadius.circular(18),
@@ -1021,19 +892,15 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
         decoration: BoxDecoration(
           color: isActive ? color.withOpacity(0.15) : Colors.black26,
           borderRadius: BorderRadius.circular(18),
-          border: Border.all(
-            color: isActive ? color : color.withOpacity(0.3),
-            width: 1.5,
-          ),
-          boxShadow: isActive
-              ? [ BoxShadow( color: color.withOpacity(0.3), blurRadius: 8, spreadRadius: 0, ),] : null,
+          border: Border.all(color: isActive ? color : color.withOpacity(0.3), width: 1.5),
+          boxShadow: isActive ? [BoxShadow(color: color.withOpacity(0.3), blurRadius: 8, spreadRadius: 0)] : null,
         ),
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon( icon, color: isActive ? color : Colors.white70, size: 28,),
+            Icon(icon, color: isActive ? color : Colors.white70, size: 28),
             const SizedBox(height: 8),
-            Text( label, style: TextStyle( fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1, color: isActive ? color : Colors.white70,),),
+            Text(label, style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 1, color: isActive ? color : Colors.white70)),
           ],
         ),
       ),
@@ -1044,17 +911,14 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
     final TextEditingController serverController = TextEditingController(text: serverAddress);
     final theme = Theme.of(context);
 
-    // StatefulBuilder verwenden, um den Zustand des Switches im Dialog zu verwalten
     return StatefulBuilder(
       builder: (context, setDialogState) {
         return Dialog(
           backgroundColor: const Color(0xFF16213E),
-          shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(20),
-          ),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
           child: Padding(
             padding: const EdgeInsets.all(24.0),
-            child: SingleChildScrollView( // Hinzugefügt für kleinere Bildschirme
+            child: SingleChildScrollView(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -1063,14 +927,7 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
                     children: [
                       Icon(Icons.wifi, color: theme.colorScheme.primary),
                       const SizedBox(width: 12),
-                      Text(
-                        'Verbindung & Steuerung', // Aktualisierter Titel
-                        style: const TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.bold,
-                          color: Colors.white,
-                        ),
-                      ),
+                      const Text('Verbindung & Steuerung', style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.white)),
                     ],
                   ),
                   const SizedBox(height: 24),
@@ -1080,114 +937,67 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
                     decoration: InputDecoration(
                       labelText: 'Server-Adresse',
                       labelStyle: const TextStyle(color: Colors.white70),
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: theme.colorScheme.primary.withOpacity(0.5)),
-                      ),
-                      focusedBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: theme.colorScheme.primary),
-                      ),
+                      enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: theme.colorScheme.primary.withOpacity(0.5))),
+                      focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: theme.colorScheme.primary)),
                       prefixIcon: Icon(Icons.link, color: theme.colorScheme.primary),
                     ),
                   ),
-                  const SizedBox(height: 16), // Reduzierter Abstand
-                  // --- Tilt Control Switch ---
+                  const SizedBox(height: 16),
                   SwitchListTile(
                     title: const Text('Kipp-Steuerung aktivieren', style: TextStyle(color: Colors.white)),
-                    subtitle: Text(
-                      'Nur Lenkung über Handybewegung', // Angepasster Text
-                      style: TextStyle(color: Colors.white.withOpacity(0.7), fontSize: 12),
-                    ),
-                    value: _useTiltControl, // Haupt-Zustandsvariable verwenden
+                    subtitle: Text('Nur Lenkung über Handybewegung', style: TextStyle(color: Colors.white.withOpacity(0.7), fontSize: 12)),
+                    value: _useTiltControl,
                     onChanged: (bool value) {
-                      // --- WICHTIG: Hauptbildschirm-Zustand direkt aktualisieren ---
-                      // Dies stellt sicher, dass die Änderung sofort wirksam wird
-                      // und die Listener gestartet/gestoppt werden.
-                      setState(() { // Zustand von ControllerScreen aktualisieren
+                      setState(() { // Haupt-State aktualisieren
                         _useTiltControl = value;
                         if (_useTiltControl) {
-                          _startTiltControl(); // Sofort starten
-                          // Richtung auf 0 setzen, wenn Kippsteuerung aktiviert wird? Optional.
-                          // direction = 0;
-                          // _sendCommand('direction', 0);
+                          _startTiltControl();
                         } else {
-                          _stopTiltControl(); // Sofort stoppen
-                          // Richtung auf 0 setzen, wenn Kippsteuerung deaktiviert wird? Optional.
-                          // direction = 0;
-                          // _sendCommand('direction', 0);
+                          _stopTiltControl();
                         }
                       });
-                      // Den Dialog-Zustand auch aktualisieren, damit der Switch visuell umschaltet
-                      setDialogState(() {});
+                      setDialogState(() {}); // Dialog-State für Switch-Anzeige
                     },
                     activeColor: theme.colorScheme.primary,
                     secondary: Icon(Icons.screen_rotation_alt, color: theme.colorScheme.primary),
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 0), // Padding anpassen
+                    contentPadding: EdgeInsets.zero,
                   ),
-                  // --- End Tilt Control Switch ---
                   const SizedBox(height: 16),
                   Row(
                     children: [
                       const Text('Status: ', style: TextStyle(color: Colors.white70)),
-                      Text(
-                        connectionStatus,
-                        style: TextStyle(
-                          color: isConnected ? Colors.greenAccent : Colors.redAccent,
-                          fontWeight: FontWeight.bold,
+                      Flexible( // Um Überlauf zu verhindern
+                        child: Text(
+                          connectionStatus,
+                          style: TextStyle(color: isConnected ? Colors.greenAccent : Colors.redAccent, fontWeight: FontWeight.bold),
+                          overflow: TextOverflow.ellipsis,
                         ),
                       ),
                     ],
                   ),
-                  const SizedBox(height: 16), // Etwas Abstand
-                  const Center(
-                    child: Text(
-                      'E-Mail bei Problemen: jontepuschmann01@gmail.com',
-                      style: TextStyle(
-                        color: Colors.white54,
-                        fontSize: 10,
-                      ),
-                    ),
-                  ),
+                  const SizedBox(height: 16),
+                  const Center(child: Text('E-Mail bei Problemen: jonte.puschmann.mail@gmail.com', style: TextStyle(color: Colors.white54, fontSize: 10))),
                   const SizedBox(height: 24),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.end,
                     children: [
                       TextButton(
-                        onPressed: () {
-                          Navigator.of(context).pop();
-                          // Falls Änderungen nur temporär waren, hier ggf. zurücksetzen
-                        },
+                        onPressed: () => Navigator.of(context).pop(),
                         child: const Text('Schließen', style: TextStyle(color: Colors.white70)),
                       ),
                       const SizedBox(width: 16),
-                      ElevatedButton.icon( // Geändert zu Icon-Button
+                      ElevatedButton.icon(
                         icon: const Icon(Icons.wifi_tethering),
-                        label: const Text( 'Testen & Speichern', style: TextStyle(fontWeight: FontWeight.bold),),
+                        label: const Text('Testen & Speichern', style: TextStyle(fontWeight: FontWeight.bold)),
                         onPressed: () {
-                          // Serveradresse aus Textfeld aktualisieren
                           final newAddress = serverController.text;
-                          bool addressChanged = newAddress != serverAddress;
-                          setState(() {
-                            serverAddress = newAddress;
-                            // _useTiltControl wurde bereits durch onChanged des Switches aktualisiert
-                          });
-
-                          Navigator.of(context).pop(); // Dialog zuerst schließen
-
-                          // Verbindung nur testen, wenn Adresse geändert wurde oder nicht verbunden
-                          if (addressChanged || !isConnected) {
-                            _testConnection();
-                          } else {
-                            // Wenn bereits verbunden und Adresse nicht geändert,
-                            // sicherstellen, dass der Kipp-Timer korrekt gestartet/gestoppt ist
-                            if(_useTiltControl && isConnected && _tiltUpdateTimer == null) {
-                              _startTiltUpdateTimer();
-                            } else if (!_useTiltControl) {
-                              _stopTiltUpdateTimer(); // Sicherstellen, dass er aus ist
-                            }
+                          if (mounted) {
+                            setState(() {
+                              serverAddress = newAddress;
+                            });
                           }
-
+                          Navigator.of(context).pop();
+                          _testConnection(isManualAttempt: true); // Wichtig: Als manuellen Versuch markieren
                         },
                         style: ElevatedButton.styleFrom(
                           backgroundColor: theme.colorScheme.primary,
@@ -1196,7 +1006,6 @@ class _ControllerScreenState extends State<ControllerScreen> with SingleTickerPr
                           padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
                           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                         ),
-
                       ),
                     ],
                   ),
